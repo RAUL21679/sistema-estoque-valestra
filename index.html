@@ -1,141 +1,1 @@
-<html><head><style>body {
-   color: black;
-}
-</style></head><body><h1 id="migrando-o-front-end-do-prot-tipo-para-supabase">Migrando o Front-end do Protótipo para Supabase</h1>
-<p>Este guia mostra o padrão de troca, módulo a módulo — a estrutura de telas, cálculos (saldo,
-consumo 90 dias, relatório de compra) e HTML do protótipo <strong>não precisam mudar</strong>; o que muda é
-só a camada de dados (<code>window.storage</code> → <code>supabase-js</code>) e a entrada por login real.</p>
-<h2 id="1-incluir-o-cliente-supabase">1. Incluir o cliente Supabase</h2>
-<p>No <code>&lt;head&gt;</code> do HTML, junto com o SheetJS que já existe:</p>
-<pre><code class="lang-html"><span class="hljs-tag">&lt;<span class="hljs-name">script</span> <span class="hljs-attr">src</span>=<span class="hljs-string">"https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"</span>&gt;</span><span class="undefined"></span><span class="hljs-tag">&lt;/<span class="hljs-name">script</span>&gt;</span>
-</code></pre>
-<p>E no início do <code>&lt;script&gt;</code> principal:</p>
-<pre><code class="lang-js"><span class="hljs-keyword">const</span> SUPABASE_URL = <span class="hljs-string">'https://xxxxx.supabase.co'</span>;   <span class="hljs-comment">// Project Settings → API</span>
-<span class="hljs-keyword">const</span> SUPABASE_ANON_KEY = <span class="hljs-string">'eyJhbGciOi...'</span>;            <span class="hljs-comment">// anon public key — segura no frontend</span>
-<span class="hljs-keyword">const</span> supabase = <span class="hljs-built_in">window</span>.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-</code></pre>
-<h2 id="2-login-substitui-o-seletor-de-papel-simulado">2. Login — substitui o seletor de &quot;papel&quot; simulado</h2>
-<p>O <code>&lt;select&gt;</code> de &quot;Visualizando como&quot; no menu lateral deixa de existir. No lugar, uma tela de
-login simples antes de renderizar o app:</p>
-<pre><code class="lang-js"><span class="hljs-keyword">let</span> sessaoAtual = <span class="hljs-literal">null</span>;
-<span class="hljs-keyword">let</span> meuPerfil = <span class="hljs-literal">null</span>; <span class="hljs-comment">// { papel, estoque_id }</span>
-
-<span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">iniciar</span>(<span class="hljs-params"></span>)</span>{
-  <span class="hljs-keyword">const</span> { <span class="hljs-attr">data</span>: { session } } = <span class="hljs-keyword">await</span> supabase.auth.getSession();
-  <span class="hljs-keyword">if</span>(!session){ renderTelaLogin(); <span class="hljs-keyword">return</span>; }
-  sessaoAtual = session;
-  <span class="hljs-keyword">const</span> { <span class="hljs-attr">data</span>: perfil } = <span class="hljs-keyword">await</span> supabase.from(<span class="hljs-string">'perfis'</span>).select(<span class="hljs-string">'papel, estoque_id'</span>).single();
-  meuPerfil = perfil;
-  <span class="hljs-keyword">await</span> loadAll();
-  render();
-}
-
-<span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">fazerLogin</span>(<span class="hljs-params">email, senha</span>)</span>{
-  <span class="hljs-keyword">const</span> { error } = <span class="hljs-keyword">await</span> supabase.auth.signInWithPassword({ email, <span class="hljs-attr">password</span>: senha });
-  <span class="hljs-keyword">if</span>(error){ toast(<span class="hljs-string">'Login inválido: '</span> + error.message); <span class="hljs-keyword">return</span>; }
-  location.reload();
-}
-
-<span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">sair</span>(<span class="hljs-params"></span>)</span>{
-  <span class="hljs-keyword">await</span> supabase.auth.signOut();
-  location.reload();
-}
-</code></pre>
-<p><code>meuPerfil.papel</code> e <code>meuPerfil.estoque_id</code> substituem o <code>state.role</code> do protótipo em todas as
-checagens de acesso (<code>canAccess</code>, <code>visibleEstoques</code> etc.) — a lógica de UI (mostrar/esconder
-botões) continua igual, só troca a fonte do dado. A checagem que realmente importa, porém, já
-não depende mais do frontend: é a Row Level Security do banco (<code>schema.sql</code>) que impede o acesso
-de fato, mesmo que alguém adultere o JavaScript no navegador.</p>
-<h2 id="3-trocar-sget-sset-por-consultas-supabase">3. Trocar <code>sGet</code>/<code>sSet</code> por consultas Supabase</h2>
-<p>O padrão do protótipo era um key-value genérico. Com tabelas de verdade, cada entidade tem sua
-própria consulta — mais simples do que parece, porque o Supabase já filtra pelo RLS
-automaticamente (você não precisa repetir <code>where estoque_id = ...</code> no client, o banco já faz
-isso sozinho):</p>
-<pre><code class="lang-js"><span class="hljs-comment">// ESTOQUES — antes: sGet('estoques') / sSet('estoques', array)</span>
-<span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">carregarEstoques</span>(<span class="hljs-params"></span>)</span>{
-  <span class="hljs-keyword">const</span> { data, error } = <span class="hljs-keyword">await</span> supabase.from(<span class="hljs-string">'estoques'</span>).select(<span class="hljs-string">'*'</span>).eq(<span class="hljs-string">'ativo'</span>, <span class="hljs-literal">true</span>);
-  <span class="hljs-keyword">if</span>(error){ toast(<span class="hljs-string">'Erro ao carregar estoques: '</span>+error.message); <span class="hljs-keyword">return</span> []; }
-  <span class="hljs-keyword">return</span> data;
-}
-<span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">criarEstoqueSupabase</span>(<span class="hljs-params">nome, tipo</span>)</span>{
-  <span class="hljs-keyword">const</span> { data, error } = <span class="hljs-keyword">await</span> supabase.from(<span class="hljs-string">'estoques'</span>).insert({ nome, tipo }).select().single();
-  <span class="hljs-keyword">if</span>(error){ toast(<span class="hljs-string">'Erro ao criar estoque: '</span>+error.message); <span class="hljs-keyword">return</span> <span class="hljs-literal">null</span>; }
-  <span class="hljs-keyword">return</span> data;
-}
-
-<span class="hljs-comment">// PRODUTOS — antes: sGet('produtos') / sSet('produtos', array)</span>
-<span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">carregarProdutos</span>(<span class="hljs-params"></span>)</span>{
-  <span class="hljs-keyword">const</span> { data } = <span class="hljs-keyword">await</span> supabase.from(<span class="hljs-string">'produtos'</span>).select(<span class="hljs-string">'*'</span>).order(<span class="hljs-string">'codigo'</span>);
-  <span class="hljs-keyword">return</span> data || [];
-}
-<span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">upsertProduto</span>(<span class="hljs-params">codigo, descricao</span>)</span>{
-  <span class="hljs-keyword">const</span> { error } = <span class="hljs-keyword">await</span> supabase.from(<span class="hljs-string">'produtos'</span>).upsert({ codigo, descricao });
-  <span class="hljs-keyword">if</span>(error) toast(<span class="hljs-string">'Erro ao salvar produto: '</span>+error.message);
-}
-
-<span class="hljs-comment">// MOVIMENTAÇÕES — antes: sGet('mov:'+estoqueId) / sSet('mov:'+estoqueId, array)</span>
-<span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">carregarMovimentacoes</span>(<span class="hljs-params">estoqueId</span>)</span>{
-  <span class="hljs-keyword">const</span> { data } = <span class="hljs-keyword">await</span> supabase
-    .from(<span class="hljs-string">'movimentacoes'</span>)
-    .select(<span class="hljs-string">'*'</span>)
-    .eq(<span class="hljs-string">'estoque_id'</span>, estoqueId)
-    .order(<span class="hljs-string">'criado_em'</span>, { <span class="hljs-attr">ascending</span>: <span class="hljs-literal">false</span> });
-  <span class="hljs-keyword">return</span> data || [];
-}
-<span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">criarMovimentacao</span>(<span class="hljs-params">{ estoqueId, codigo, quantidade, tipo, categoria, origem, observacao }</span>)</span>{
-  <span class="hljs-keyword">const</span> { data, error } = <span class="hljs-keyword">await</span> supabase.from(<span class="hljs-string">'movimentacoes'</span>).insert({
-    <span class="hljs-attr">estoque_id</span>: estoqueId, codigo, quantidade, tipo, categoria, origem, observacao,
-    <span class="hljs-attr">criado_por</span>: sessaoAtual.user.id,
-  }).select().single();
-  <span class="hljs-keyword">if</span>(error){ toast(<span class="hljs-string">'Erro ao registrar movimentação: '</span>+error.message); <span class="hljs-keyword">return</span> <span class="hljs-literal">null</span>; }
-  <span class="hljs-keyword">return</span> data;
-}
-
-<span class="hljs-comment">// SALDO — antes: calculado em JS a partir do array de movs em memória</span>
-<span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">carregarSaldo</span>(<span class="hljs-params">estoqueId</span>)</span>{
-  <span class="hljs-keyword">const</span> { data } = <span class="hljs-keyword">await</span> supabase.from(<span class="hljs-string">'saldo_estoque'</span>).select(<span class="hljs-string">'*'</span>).eq(<span class="hljs-string">'estoque_id'</span>, estoqueId);
-  <span class="hljs-keyword">return</span> <span class="hljs-built_in">Object</span>.fromEntries((data||[]).map(<span class="hljs-function"><span class="hljs-params">r</span> =&gt;</span> [r.codigo, <span class="hljs-built_in">Number</span>(r.saldo)]));
-}
-</code></pre>
-<ul>
-<li><code>consumo90</code>, <code>mediaDiaria</code>, <code>estoqueMinimo60</code>, <code>cobertura</code> (de <code>business-rules.md</code>) continuam
-sendo calculados <strong>em JavaScript no frontend</strong>, só que agora a partir do resultado de
-<code>carregarMovimentacoes</code> (ou de uma consulta filtrada por data) em vez do array em memória —
-a fórmula não muda, só a origem dos dados.</li>
-<li>Importações em lote: em vez de inserir uma linha por vez, montar o array completo de objetos e
-usar <code>supabase.from(&#39;movimentacoes&#39;).insert(arrayComTodasAsLinhas)</code> — um único INSERT para o
-lote inteiro (é a mesma correção de performance que já fizemos no protótipo, agora expressa
-como uma chamada só ao Supabase).</li>
-</ul>
-<h2 id="4-realtime-opcional-mas-f-cil-de-ligar-">4. Realtime (opcional, mas fácil de ligar)</h2>
-<p>Uma vantagem de sair do <code>window.storage</code> para Supabase: dá pra saber quando outra pessoa lança
-uma movimentação, sem precisar dar F5:</p>
-<pre><code class="lang-js">supabase
-  .channel(<span class="hljs-string">'movs-changes'</span>)
-  .on(<span class="hljs-string">'postgres_changes'</span>, { <span class="hljs-string">event:</span> <span class="hljs-string">'INSERT'</span>, <span class="hljs-string">schema:</span> <span class="hljs-string">'public'</span>, <span class="hljs-string">table:</span> <span class="hljs-string">'movimentacoes'</span> }, payload =&gt; {
-    <span class="hljs-keyword">if</span>(payload.<span class="hljs-keyword">new</span>.estoque_id === state.route.id) { <span class="hljs-comment">/* recarregar a tela atual */</span> renderMain(); }
-  })
-  .subscribe();
-</code></pre>
-<h2 id="5-o-que-fica-igual">5. O que fica igual</h2>
-<ul>
-<li>Todo o HTML/CSS (o visual &quot;etiqueta de estante&quot;, a logo, as abas Saldo &amp; Análise / Movimentações
-/ Inventário / Validades).</li>
-<li>Os parsers de XML/Excel/CSV/TXT e a detecção de encoding UTF-8/Windows-1252 — isso não depende
-de onde os dados são salvos.</li>
-<li>As fórmulas de <code>business-rules.md</code> (saldo, consumo, cobertura, relatório de compra).</li>
-</ul>
-<h2 id="6-ordem-sugerida-para-migrar">6. Ordem sugerida para migrar</h2>
-<ol>
-<li>Login + tela de &quot;sem estoque atribuído&quot; (perfil sem <code>estoque_id</code> e papel <code>FILIAL_USER</code>).</li>
-<li>Estoques (listar + criar) — módulo mais simples, valida a conexão de ponta a ponta.</li>
-<li>Catálogo de produtos (listar + criar/editar + import).</li>
-<li>Movimentações (listar + criar + import) — o módulo mais usado no dia a dia.</li>
-<li>Inventário, custos e validades — seguem o mesmo padrão das movimentações.</li>
-<li>Relatório de compra: pode continuar sendo montado em JS + SheetJS como está, só trocando a
-origem dos dados (consulta Supabase em vez de <code>state.movs</code>).</li>
-</ol>
-<p>Recomendo migrar e testar um módulo de cada vez nessa ordem, em vez de trocar tudo de uma vez —
-cada módulo funcionando isoladamente já é uma vitória visível e reduz o risco de um bug único
-quebrar o sistema inteiro no meio da transição.</p>
-</body></html>
+Migrando o Front-end do Protótipo para SupabaseEste guia mostra o padrão de troca, módulo a módulo — a estrutura de telas, cálculos (saldo,consumo 90 dias, relatório de compra) e HTML do protótipo não precisam mudar; o que muda ésó a camada de dados (`window.storage` → `supabase-js`) e a entrada por login real.1. Incluir o cliente SupabaseNo `<head>` do HTML, junto com o SheetJS que já existe:```html<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>```E no início do `<script>` principal:```jsconst SUPABASE_URL = 'https://dtzhyujaqlwfanqtsxax.supabase.co';   // Project Settings → APIconst SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR0emh5anVxYWx3ZmFucXRzeGF4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNTIyMTcsImV4cCI6MjEwNDcyODIxN30.rbQw-KILBntESoGS39dlRTEILmj61RcxNfCMeXYYtfY';            // anon public key — segura no frontendconst supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);```2. Login — substitui o seletor de "papel" simuladoO `<select>` de "Visualizando como" no menu lateral deixa de existir. No lugar, uma tela delogin simples antes de renderizar o app:```jslet sessaoAtual = null;let meuPerfil = null; // { papel, estoque_id }async function iniciar(){  const { data: { session } } = await supabase.auth.getSession();  if(!session){ renderTelaLogin(); return; }  sessaoAtual = session;  const { data: perfil } = await supabase.from('perfis').select('papel, estoque_id').single();  meuPerfil = perfil;  await loadAll();  render();}async function fazerLogin(email, senha){  const { error } = await supabase.auth.signInWithPassword({ email, password: senha });  if(error){ toast('Login inválido: ' + error.message); return; }  location.reload();}async function sair(){  await supabase.auth.signOut();  location.reload();}````meuPerfil.papel` e `meuPerfil.estoque_id` substituem o `state.role` do protótipo em todas aschecagens de acesso (`canAccess`, `visibleEstoques` etc.) — a lógica de UI (mostrar/esconderbotões) continua igual, só troca a fonte do dado. A checagem que realmente importa, porém, jánão depende mais do frontend: é a Row Level Security do banco (`schema.sql`) que impede o acessode fato, mesmo que alguém adultere o JavaScript no navegador.3. Trocar `sGet`/`sSet` por consultas SupabaseO padrão do protótipo era um key-value genérico. Com tabelas de verdade, cada entidade tem suaprópria consulta — mais simples do que parece, porque o Supabase já filtra pelo RLSautomaticamente (você não precisa repetir `where estoque_id = ...` no client, o banco já fazisso sozinho):```js// ESTOQUES — antes: sGet('estoques') / sSet('estoques', array)async function carregarEstoques(){  const { data, error } = await supabase.from('estoques').select('*').eq('ativo', true);  if(error){ toast('Erro ao carregar estoques: '+error.message); return []; }  return data;}async function criarEstoqueSupabase(nome, tipo){  const { data, error } = await supabase.from('estoques').insert({ nome, tipo }).select().single();  if(error){ toast('Erro ao criar estoque: '+error.message); return null; }  return data;}// PRODUTOS — antes: sGet('produtos') / sSet('produtos', array)async function carregarProdutos(){  const { data } = await supabase.from('produtos').select('*').order('codigo');  return data || [];}async function upsertProduto(codigo, descricao){  const { error } = await supabase.from('produtos').upsert({ codigo, descricao });  if(error) toast('Erro ao salvar produto: '+error.message);}// MOVIMENTAÇÕES — antes: sGet('mov:'+estoqueId) / sSet('mov:'+estoqueId, array)async function carregarMovimentacoes(estoqueId){  const { data } = await supabase    .from('movimentacoes')    .select('*')    .eq('estoque_id', estoqueId)    .order('criado_em', { ascending: false });  return data || [];}async function criarMovimentacao({ estoqueId, codigo, quantidade, tipo, categoria, origem, observacao }){  const { data, error } = await supabase.from('movimentacoes').insert({    estoque_id: estoqueId, codigo, quantidade, tipo, categoria, origem, observacao,    criado_por: sessaoAtual.user.id,  }).select().single();  if(error){ toast('Erro ao registrar movimentação: '+error.message); return null; }  return data;}// SALDO — antes: calculado em JS a partir do array de movs em memóriaasync function carregarSaldo(estoqueId){  const { data } = await supabase.from('saldo_estoque').select('*').eq('estoque_id', estoqueId);  return Object.fromEntries((data||[]).map(r => [r.codigo, Number(r.saldo)]));}````consumo90`, `mediaDiaria`, `estoqueMinimo60`, `cobertura` (de `business-rules.md`) continuamsendo calculados em JavaScript no frontend, só que agora a partir do resultado de`carregarMovimentacoes` (ou de uma consulta filtrada por data) em vez do array em memória —a fórmula não muda, só a origem dos dados.Importações em lote: em vez de inserir uma linha por vez, montar o array completo de objetos eusar `supabase.from('movimentacoes').insert(arrayComTodasAsLinhas)` — um único INSERT para olote inteiro (é a mesma correção de performance que já fizemos no protótipo, agora expressacomo uma chamada só ao Supabase).4. Realtime (opcional, mas fácil de ligar)Uma vantagem de sair do `window.storage` para Supabase: dá pra saber quando outra pessoa lançauma movimentação, sem precisar dar F5:```jssupabase  .channel('movs-changes')  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'movimentacoes' }, payload => {    if(payload.new.estoque_id === state.route.id) { /* recarregar a tela atual */ renderMain(); }  })  .subscribe();```5. O que fica igualTodo o HTML/CSS (o visual "etiqueta de estante", a logo, as abas Saldo & Análise / Movimentações/ Inventário / Validades).Os parsers de XML/Excel/CSV/TXT e a detecção de encoding UTF-8/Windows-1252 — isso não dependede onde os dados são salvos.As fórmulas de `business-rules.md` (saldo, consumo, cobertura, relatório de compra).6. Ordem sugerida para migrarLogin + tela de "sem estoque atribuído" (perfil sem `estoque_id` e papel `FILIAL_USER`).Estoques (listar + criar) — módulo mais simples, valida a conexão de ponta a ponta.Catálogo de produtos (listar + criar/editar + import).Movimentações (listar + criar + import) — o módulo mais usado no dia a dia.Inventário, custos e validades — seguem o mesmo padrão das movimentações.Relatório de compra: pode continuar sendo montado em JS + SheetJS como está, só trocando aorigem dos dados (consulta Supabase em vez de `state.movs`).Recomendo migrar e testar um módulo de cada vez nessa ordem, em vez de trocar tudo de uma vez —cada módulo funcionando isoladamente já é uma vitória visível e reduz o risco de um bug únicoquebrar o sistema inteiro no meio da transição.
