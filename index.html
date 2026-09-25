@@ -1,1 +1,78 @@
-Migrando o Front-end do Protótipo para SupabaseEste guia mostra o padrão de troca, módulo a módulo — a estrutura de telas, cálculos (saldo,consumo 90 dias, relatório de compra) e HTML do protótipo não precisam mudar; o que muda ésó a camada de dados (`window.storage` → `supabase-js`) e a entrada por login real.1. Incluir o cliente SupabaseNo `<head>` do HTML, junto com o SheetJS que já existe:```html<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>```E no início do `<script>` principal:```jsconst SUPABASE_URL = 'https://dtzhyujaqlwfanqtsxax.supabase.co';   // Project Settings → APIconst SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR0emh5anVxYWx3ZmFucXRzeGF4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNTIyMTcsImV4cCI6MjEwNDcyODIxN30.rbQw-KILBntESoGS39dlRTEILmj61RcxNfCMeXYYtfY';            // anon public key — segura no frontendconst supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);```2. Login — substitui o seletor de "papel" simuladoO `<select>` de "Visualizando como" no menu lateral deixa de existir. No lugar, uma tela delogin simples antes de renderizar o app:```jslet sessaoAtual = null;let meuPerfil = null; // { papel, estoque_id }async function iniciar(){  const { data: { session } } = await supabase.auth.getSession();  if(!session){ renderTelaLogin(); return; }  sessaoAtual = session;  const { data: perfil } = await supabase.from('perfis').select('papel, estoque_id').single();  meuPerfil = perfil;  await loadAll();  render();}async function fazerLogin(email, senha){  const { error } = await supabase.auth.signInWithPassword({ email, password: senha });  if(error){ toast('Login inválido: ' + error.message); return; }  location.reload();}async function sair(){  await supabase.auth.signOut();  location.reload();}````meuPerfil.papel` e `meuPerfil.estoque_id` substituem o `state.role` do protótipo em todas aschecagens de acesso (`canAccess`, `visibleEstoques` etc.) — a lógica de UI (mostrar/esconderbotões) continua igual, só troca a fonte do dado. A checagem que realmente importa, porém, jánão depende mais do frontend: é a Row Level Security do banco (`schema.sql`) que impede o acessode fato, mesmo que alguém adultere o JavaScript no navegador.3. Trocar `sGet`/`sSet` por consultas SupabaseO padrão do protótipo era um key-value genérico. Com tabelas de verdade, cada entidade tem suaprópria consulta — mais simples do que parece, porque o Supabase já filtra pelo RLSautomaticamente (você não precisa repetir `where estoque_id = ...` no client, o banco já fazisso sozinho):```js// ESTOQUES — antes: sGet('estoques') / sSet('estoques', array)async function carregarEstoques(){  const { data, error } = await supabase.from('estoques').select('*').eq('ativo', true);  if(error){ toast('Erro ao carregar estoques: '+error.message); return []; }  return data;}async function criarEstoqueSupabase(nome, tipo){  const { data, error } = await supabase.from('estoques').insert({ nome, tipo }).select().single();  if(error){ toast('Erro ao criar estoque: '+error.message); return null; }  return data;}// PRODUTOS — antes: sGet('produtos') / sSet('produtos', array)async function carregarProdutos(){  const { data } = await supabase.from('produtos').select('*').order('codigo');  return data || [];}async function upsertProduto(codigo, descricao){  const { error } = await supabase.from('produtos').upsert({ codigo, descricao });  if(error) toast('Erro ao salvar produto: '+error.message);}// MOVIMENTAÇÕES — antes: sGet('mov:'+estoqueId) / sSet('mov:'+estoqueId, array)async function carregarMovimentacoes(estoqueId){  const { data } = await supabase    .from('movimentacoes')    .select('*')    .eq('estoque_id', estoqueId)    .order('criado_em', { ascending: false });  return data || [];}async function criarMovimentacao({ estoqueId, codigo, quantidade, tipo, categoria, origem, observacao }){  const { data, error } = await supabase.from('movimentacoes').insert({    estoque_id: estoqueId, codigo, quantidade, tipo, categoria, origem, observacao,    criado_por: sessaoAtual.user.id,  }).select().single();  if(error){ toast('Erro ao registrar movimentação: '+error.message); return null; }  return data;}// SALDO — antes: calculado em JS a partir do array de movs em memóriaasync function carregarSaldo(estoqueId){  const { data } = await supabase.from('saldo_estoque').select('*').eq('estoque_id', estoqueId);  return Object.fromEntries((data||[]).map(r => [r.codigo, Number(r.saldo)]));}````consumo90`, `mediaDiaria`, `estoqueMinimo60`, `cobertura` (de `business-rules.md`) continuamsendo calculados em JavaScript no frontend, só que agora a partir do resultado de`carregarMovimentacoes` (ou de uma consulta filtrada por data) em vez do array em memória —a fórmula não muda, só a origem dos dados.Importações em lote: em vez de inserir uma linha por vez, montar o array completo de objetos eusar `supabase.from('movimentacoes').insert(arrayComTodasAsLinhas)` — um único INSERT para olote inteiro (é a mesma correção de performance que já fizemos no protótipo, agora expressacomo uma chamada só ao Supabase).4. Realtime (opcional, mas fácil de ligar)Uma vantagem de sair do `window.storage` para Supabase: dá pra saber quando outra pessoa lançauma movimentação, sem precisar dar F5:```jssupabase  .channel('movs-changes')  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'movimentacoes' }, payload => {    if(payload.new.estoque_id === state.route.id) { /* recarregar a tela atual */ renderMain(); }  })  .subscribe();```5. O que fica igualTodo o HTML/CSS (o visual "etiqueta de estante", a logo, as abas Saldo & Análise / Movimentações/ Inventário / Validades).Os parsers de XML/Excel/CSV/TXT e a detecção de encoding UTF-8/Windows-1252 — isso não dependede onde os dados são salvos.As fórmulas de `business-rules.md` (saldo, consumo, cobertura, relatório de compra).6. Ordem sugerida para migrarLogin + tela de "sem estoque atribuído" (perfil sem `estoque_id` e papel `FILIAL_USER`).Estoques (listar + criar) — módulo mais simples, valida a conexão de ponta a ponta.Catálogo de produtos (listar + criar/editar + import).Movimentações (listar + criar + import) — o módulo mais usado no dia a dia.Inventário, custos e validades — seguem o mesmo padrão das movimentações.Relatório de compra: pode continuar sendo montado em JS + SheetJS como está, só trocando aorigem dos dados (consulta Supabase em vez de `state.movs`).Recomendo migrar e testar um módulo de cada vez nessa ordem, em vez de trocar tudo de uma vez —cada módulo funcionando isoladamente já é uma vitória visível e reduz o risco de um bug únicoquebrar o sistema inteiro no meio da transição.
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+const SUPABASE_URL = 'https://dtzhyujaqlwfanqtsxax.supabase.co';   // Project Settings → API
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR0emh5anVxYWx3ZmFucXRzeGF4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNTIyMTcsImV4cCI6MjEwNDcyODIxN30.rbQw-KILBntESoGS39dlRTEILmj61RcxNfCMeXYYtfY';            // anon public key — segura no frontend
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+let sessaoAtual = null;
+let meuPerfil = null; // { papel, estoque_id }
+
+async function iniciar(){
+  const { data: { session } } = await supabase.auth.getSession();
+  if(!session){ renderTelaLogin(); return; }
+  sessaoAtual = session;
+  const { data: perfil } = await supabase.from('perfis').select('papel, estoque_id').single();
+  meuPerfil = perfil;
+  await loadAll();
+  render();
+}
+
+async function fazerLogin(email, senha){
+  const { error } = await supabase.auth.signInWithPassword({ email, password: senha });
+  if(error){ toast('Login inválido: ' + error.message); return; }
+  location.reload();
+}
+
+async function sair(){
+  await supabase.auth.signOut();
+  location.reload();
+}
+// ESTOQUES — antes: sGet('estoques') / sSet('estoques', array)
+async function carregarEstoques(){
+  const { data, error } = await supabase.from('estoques').select('*').eq('ativo', true);
+  if(error){ toast('Erro ao carregar estoques: '+error.message); return []; }
+  return data;
+}
+async function criarEstoqueSupabase(nome, tipo){
+  const { data, error } = await supabase.from('estoques').insert({ nome, tipo }).select().single();
+  if(error){ toast('Erro ao criar estoque: '+error.message); return null; }
+  return data;
+}
+
+// PRODUTOS — antes: sGet('produtos') / sSet('produtos', array)
+async function carregarProdutos(){
+  const { data } = await supabase.from('produtos').select('*').order('codigo');
+  return data || [];
+}
+async function upsertProduto(codigo, descricao){
+  const { error } = await supabase.from('produtos').upsert({ codigo, descricao });
+  if(error) toast('Erro ao salvar produto: '+error.message);
+}
+
+// MOVIMENTAÇÕES — antes: sGet('mov:'+estoqueId) / sSet('mov:'+estoqueId, array)
+async function carregarMovimentacoes(estoqueId){
+  const { data } = await supabase
+    .from('movimentacoes')
+    .select('*')
+    .eq('estoque_id', estoqueId)
+    .order('criado_em', { ascending: false });
+  return data || [];
+}
+async function criarMovimentacao({ estoqueId, codigo, quantidade, tipo, categoria, origem, observacao }){
+  const { data, error } = await supabase.from('movimentacoes').insert({
+    estoque_id: estoqueId, codigo, quantidade, tipo, categoria, origem, observacao,
+    criado_por: sessaoAtual.user.id,
+  }).select().single();
+  if(error){ toast('Erro ao registrar movimentação: '+error.message); return null; }
+  return data;
+}
+
+// SALDO — antes: calculado em JS a partir do array de movs em memória
+async function carregarSaldo(estoqueId){
+  const { data } = await supabase.from('saldo_estoque').select('*').eq('estoque_id', estoqueId);
+  return Object.fromEntries((data||[]).map(r => [r.codigo, Number(r.saldo)]));
+}
+supabase
+  .channel('movs-changes')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'movimentacoes' }, payload => {
+    if(payload.new.estoque_id === state.route.id) { /* recarregar a tela atual */ renderMain(); }
+  })
+  .subscribe();
